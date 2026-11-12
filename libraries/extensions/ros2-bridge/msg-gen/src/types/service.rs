@@ -134,6 +134,8 @@ impl Service {
             #[allow(non_snake_case)]
             pub fn #create_client(node: &mut Ros2Node, name_space: &str, base_name: &str, qos: ffi::Ros2QosPolicies, events: &mut crate::ffi::CombinedEvents) -> eyre::Result<Box<#client_name>> {
                 use futures::StreamExt as _;
+                const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+                const MAX_PENDING_REQUESTS: usize = 64;
 
                 let client = node.dds_node_mut()?.create_client::< service :: #self_name >(
                     crate::ros2_client::ServiceMapping:: #ros_service_mapping,
@@ -148,8 +150,13 @@ impl Service {
                 // response. `receive_response` can hand back responses for *other*
                 // clients sharing the service topic (see its rustdoc), so the pump
                 // forwards only responses whose id is in this set.
-                let pending: std::sync::Arc<std::sync::Mutex<Vec<crate::ros2_client::service::RmwRequestId>>> =
-                    std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let pending: std::sync::Arc<std::sync::Mutex<dora_ros2_bridge::transport::dds::PendingDdsRequests<crate::ros2_client::service::RmwRequestId>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        dora_ros2_bridge::transport::dds::PendingDdsRequests::new(
+                            MAX_PENDING_REQUESTS,
+                            Some(REQUEST_TIMEOUT),
+                        ),
+                    ));
                 let (response_tx, response_rx) = flume::bounded(1);
                 let stream = response_rx.into_stream().map(|v: eyre::Result<_>| Box::new(v) as Box<dyn std::any::Any + 'static>);
                 let id = events.events.merge(Box::pin(stream));
@@ -175,13 +182,9 @@ impl Service {
                                     // they belong to another client and are delivered
                                     // to that client's own pump too.
                                     let is_ours = match pending.lock() {
-                                        Ok(mut pending) => match pending.iter().position(|pid| *pid == req_id) {
-                                            Some(pos) => {
-                                                pending.remove(pos);
-                                                true
-                                            }
-                                            None => false,
-                                        },
+                                        Ok(mut pending) => pending
+                                            .take_matching(|pending_id| *pending_id == req_id)
+                                            .is_some(),
                                         Err(_) => false,
                                     };
                                     if is_ours && response_tx.send(Ok(response)).is_err() {
@@ -530,5 +533,21 @@ mod codegen_tests {
         assert!(format_valid_rust(imp).contains(needle), "client create fn");
         let (_decl, imp) = svc.cxx_service_server_creation_functions("test_pkg");
         assert!(format_valid_rust(imp).contains(needle), "server create fn");
+    }
+
+    #[test]
+    fn service_client_evicts_expired_pending_requests() {
+        let svc = Service {
+            package: "test_pkg".to_string(),
+            name: "AddTwoInts".to_string(),
+            request: empty_msg("AddTwoInts_Request"),
+            response: empty_msg("AddTwoInts_Response"),
+        };
+        let (_decl, imp) = svc.cxx_service_creation_functions("test_pkg");
+        let client = format_valid_rust(imp);
+        assert!(client.contains("PendingDdsRequests"));
+        assert!(client.contains("REQUEST_TIMEOUT"));
+        assert!(client.contains("Some(REQUEST_TIMEOUT)"));
+        assert!(client.contains("take_matching"));
     }
 }
